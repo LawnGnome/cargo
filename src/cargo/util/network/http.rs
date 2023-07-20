@@ -133,6 +133,8 @@ pub fn configure_http_handle(config: &Config, handle: &mut Easy) -> CargoResult<
         handle.ssl_min_max_version(SslVersion::Default, SslVersion::Tlsv12)?;
     }
 
+    handle.ssl_cainfo_blob(config.tls_roots()?)?;
+
     if let Some(true) = http.debug {
         handle.verbose(true)?;
         log::debug!("{:#?}", curl::Version::get());

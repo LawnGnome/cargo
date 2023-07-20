@@ -79,8 +79,11 @@ use crate::util::{internal, toml as cargo_toml};
 use crate::util::{try_canonicalize, validate_package_name};
 use crate::util::{FileLock, Filesystem, IntoUrl, IntoUrlWithBase, Rustc};
 use anyhow::{anyhow, bail, format_err, Context as _};
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use cargo_util::paths;
 use curl::easy::Easy;
+use itertools::Itertools;
 use lazycell::LazyCell;
 use serde::de::IntoDeserializer as _;
 use serde::Deserialize;
@@ -223,6 +226,7 @@ pub struct Config {
     doc_extern_map: LazyCell<RustdocExternMap>,
     progress_config: ProgressConfig,
     env_config: LazyCell<EnvConfig>,
+    tls_roots: LazyCell<String>,
     /// This should be false if:
     /// - this is an artifact of the rustc distribution process for "stable" or for "beta"
     /// - this is an `#[test]` that does not opt in with `enable_nightly_features`
@@ -311,6 +315,7 @@ impl Config {
             doc_extern_map: LazyCell::new(),
             progress_config: ProgressConfig::default(),
             env_config: LazyCell::new(),
+            tls_roots: LazyCell::new(),
             nightly_features_allowed: matches!(&*features::channel(), "nightly" | "dev"),
             ws_roots: RefCell::new(HashMap::new()),
         }
@@ -1786,6 +1791,42 @@ impl Config {
         }
 
         Ok(env_config)
+    }
+
+    pub fn tls_roots(&self) -> CargoResult<&[u8]> {
+        Ok(self
+            .tls_roots
+            .try_borrow_with(|| -> CargoResult<String> {
+                // We want to use the certificates from the system store to respect any custom root
+                // CAs the user might need, but also want to use rustls to avoid platform specific
+                // problems with schannel.
+                let native_certs = rustls_native_certs::load_native_certs()?;
+                let mut certs = Vec::with_capacity(native_certs.len());
+                for cert in native_certs {
+                    // rustls_native_certs gives us DER encoded certificates, but we need PEM
+                    // encoded certificates for curl. The conversion isn't terribly difficult: it's
+                    // basically just base64 encoding, wrapping at 64 characters, and enclosing
+                    // each certificate with BEGIN and END markers.
+                    let der = cert.0;
+                    let pem = format!(
+                        "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----",
+                        String::from_utf8(
+                            Itertools::intersperse(
+                                STANDARD.encode(der).into_bytes().chunks(64),
+                                &[b'\n'],
+                            )
+                            .flatten()
+                            .copied()
+                            .collect::<Vec<u8>>(),
+                        )?
+                    );
+
+                    certs.push(pem);
+                }
+
+                Ok(certs.into_iter().join("\n\n"))
+            })?
+            .as_bytes())
     }
 
     /// This is used to validate the `term` table has valid syntax.
